@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-# Relay model HTTP requests, removing unsupported metadata/Responses reasoning data.
+# Relay model HTTP requests, removing unsupported metadata. Responses reasoning
+# replay is forwarded unless UPSTREAM_STRIP_REASONING is set.
 # Optionally inject the upstream credential; buffer complete responses and retry
 # selected transient failures before returning the upstream status and body.
+# Token usage is accounted per agent from each buffered model response.
 
 import json, os, sys, time, http.server, urllib.request, urllib.error
 import gzip
 
 from code_mode_limits import advertise_defaults, limit_tool_outputs, response_defaults
+from usage_meter import UsageLedger, agent_identity, is_model_path, parse_usage
 
 UPSTREAM = os.environ.get("UPSTREAM", "").strip()
 if not UPSTREAM:
@@ -19,11 +22,29 @@ UPSTREAM_DISABLED_TOOLS = frozenset(name.strip() for name in os.environ.get("UPS
 CODE_MODE_OUTPUT_TOKENS = int(os.environ.get('UPSTREAM_CODE_MODE_OUTPUT_TOKENS', '0'))
 MAX_OUTPUT_TOKENS = int(os.environ.get('UPSTREAM_MAX_OUTPUT_TOKENS', '0') or '0')
 ANTHROPIC_MODEL = os.environ.get('UPSTREAM_ANTHROPIC_MODEL', '')
+# Per-role models: "agent=model,..." sends those agents' model requests to their model.
+AGENT_MODELS = dict(item.split('=', 1) for item in os.environ.get('UPSTREAM_AGENT_MODELS', '').split(',')
+                    if '=' in item)
 ANTHROPIC_EFFORT = os.environ.get('UPSTREAM_ANTHROPIC_EFFORT', '')
 TOOL_OUTPUT_BYTES = int(os.environ.get('UPSTREAM_TOOL_OUTPUT_BYTES', '0') or '0')
 AGENT_HARNESS = os.environ.get('UPSTREAM_AGENT_HARNESS', '')
 RESPONSE_VERBOSITY = os.environ.get('UPSTREAM_RESPONSE_VERBOSITY', '')
+STRIP_REASONING = os.environ.get('UPSTREAM_STRIP_REASONING', '').strip().lower() in ('1', 'true', 'yes')
 REQUEST_TIMEOUT_SECONDS = float(os.environ.get('UPSTREAM_REQUEST_TIMEOUT_SECONDS', '600'))
+LEDGER = UsageLedger(os.environ.get('UPSTREAM_USAGE_LOG', '').strip() or None)
+# Team token budget (input + output); 0 means unlimited. At the limit model requests
+# are refused and the team driver pauses the run.
+MAX_MODEL_TOKENS = int(os.environ.get('UPSTREAM_MAX_MODEL_TOKENS', '0') or 0)
+# Requests under /raw (for example a project's own experiment code) are forwarded
+# unchanged apart from the credential: no harness rewriting of request or response.
+# They are still metered (as `project` unless they carry a worker label) and budgeted.
+RAW_PREFIX = '/raw'
+# The final evaluation's own route: also unmodified, labelled final-evaluation, and outside
+# the token budget while the driver has opened it (workers are stopped by then and cannot
+# write this file, which lives in the proxy's usage volume).
+FINAL_PREFIX = '/raw-final'
+FINAL_LABEL = 'final-evaluation'
+FINAL_OPEN_FILE = os.environ.get('UPSTREAM_FINAL_OPEN_FILE', '/data/usage/final-evaluation.open')
 HOP_BY_HOP = {"connection", "keep-alive", "proxy-connection", "te", "trailer",
               "transfer-encoding", "upgrade", "content-length"}
 
@@ -88,7 +109,9 @@ def model_request_metadata(payload):
             'max_output_tokens': payload.get('max_output_tokens', payload.get('max_tokens')),
             'verbosity': text_options.get('verbosity') if isinstance(text_options, dict) else None,
             'tool_count': tool_count,
-            'input_items': len(inputs) if isinstance(inputs, list) else None}
+            'input_items': len(inputs) if isinstance(inputs, list) else None,
+            'reasoning_items': sum(1 for item in inputs if isinstance(item, dict)
+                                   and item.get('type') == 'reasoning') if isinstance(inputs, list) else None}
 
 
 def filter_tool_declarations(payload, disabled):
@@ -233,6 +256,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b"ok\n")
             return
+        if self.path == "/usage" and self.command == "GET":
+            usage = json.dumps(LEDGER.snapshot()).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(usage)))
+            self.end_headers()
+            self.wfile.write(usage)
+            return
+        final = self.path == FINAL_PREFIX or self.path.startswith(FINAL_PREFIX + '/')
+        raw = final or self.path == RAW_PREFIX or self.path.startswith(RAW_PREFIX + '/') or self.path.startswith(RAW_PREFIX + '?')
+        if raw:
+            self.path = self.path[len(FINAL_PREFIX if final else RAW_PREFIX):] or '/'
+            if not self.path.startswith('/'):
+                self.path = '/' + self.path
+        agent = agent_identity({k.lower(): v for k, v in self.headers.items()})
+        if final:
+            agent = FINAL_LABEL
+        elif raw and agent == 'unlabelled':
+            agent = 'project'
+        metered = is_model_path(self.path)
+        exempt = final and os.path.exists(FINAL_OPEN_FILE)
+        if metered and not exempt and MAX_MODEL_TOKENS > 0 and LEDGER.budget_tokens() >= MAX_MODEL_TOKENS:
+            refusal = json.dumps({'error': {'type': 'budget_exhausted', 'message':
+                                  f'the team token budget ({MAX_MODEL_TOKENS}) is spent; the run pauses'}}).encode()
+            self.send_response(429)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(refusal)))
+            self.end_headers()
+            self.wfile.write(refusal)
+            return
+        request_model = None
         te = self.headers.get("Transfer-Encoding", "").lower()
         length = int(self.headers.get("Content-Length", "0"))
         ua = self.headers.get("User-Agent", "")[:60]
@@ -256,9 +310,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         else:
             body = self.rfile.read(length) if length else b""
         ct = self.headers.get("Content-Type", "")
-        if body and "json" in ct.lower():
+        if raw and body and "json" in ct.lower():
+            try:
+                parsed = json.loads(body)
+                if isinstance(parsed, dict) and isinstance(parsed.get('model'), str):
+                    request_model = parsed['model']
+            except ValueError:
+                pass
+        elif body and "json" in ct.lower():
             try:
                 d = json.loads(body)
+                if isinstance(d, dict) and isinstance(d.get('model'), str):
+                    request_model = d['model']
                 mutated = False
                 if isinstance(d, dict):
                     mutated = filter_tool_declarations(d, UPSTREAM_DISABLED_TOOLS)
@@ -281,6 +344,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                 mutated = True
                         if TOOL_OUTPUT_BYTES > 0:
                             mutated = limit_anthropic_tool_outputs(d, TOOL_OUTPUT_BYTES) or mutated
+                    if metered and agent in AGENT_MODELS and d.get('model') != AGENT_MODELS[agent]:
+                        d['model'] = AGENT_MODELS[agent]
+                        request_model = d['model']
+                        mutated = True
                     if "metadata" in d:
                         d.pop("metadata", None)
                         mutated = True
@@ -299,23 +366,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             if isinstance(text_options, dict) and 'verbosity' not in text_options:
                                 text_options['verbosity'] = RESPONSE_VERBOSITY
                                 mutated = True
-                        # Drop reasoning replay items and encrypted-content includes.
-                        inc = d.get("include")
-                        if isinstance(inc, list):
-                            keep = [x for x in inc if "encrypted_content" not in str(x)]
-                            if len(keep) != len(inc):
-                                if keep:
-                                    d["include"] = keep
-                                else:
-                                    d.pop("include", None)
-                                mutated = True
-                        items = d.get("input")
-                        if isinstance(items, list):
-                            keep = [it for it in items
-                                    if not (isinstance(it, dict) and it.get("type") == "reasoning")]
-                            if len(keep) != len(items):
-                                d["input"] = keep
-                                mutated = True
+                        # Stateless clients (store: false) replay earlier reasoning as
+                        # encrypted reasoning items; dropping them makes every call
+                        # start without the model's prior reasoning. Strip only for
+                        # upstreams that reject reasoning replay.
+                        if STRIP_REASONING:
+                            inc = d.get("include")
+                            if isinstance(inc, list):
+                                keep = [x for x in inc if "encrypted_content" not in str(x)]
+                                if len(keep) != len(inc):
+                                    if keep:
+                                        d["include"] = keep
+                                    else:
+                                        d.pop("include", None)
+                                    mutated = True
+                            items = d.get("input")
+                            if isinstance(items, list):
+                                keep = [it for it in items
+                                        if not (isinstance(it, dict) and it.get("type") == "reasoning")]
+                                if len(keep) != len(items):
+                                    d["input"] = keep
+                                    mutated = True
                 if mutated:
                     body = json.dumps(d).encode()
                 if isinstance(d, dict) and ('/responses' in self.path or self.path.split('?', 1)[0].rstrip('/').endswith('/messages')):
@@ -388,13 +459,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             break
         if err is not None:
             print(f"[proxy {rid}] {self.command} {self.path} in={len(body)}b({length}CL,{'chunked' if 'chunked' in te else 'plain'}) UA={ua!r} -> BAD: {err}", flush=True)
+            if metered:
+                LEDGER.record(agent, self.path, 502, request_model, None)
             try:
                 self.send_error(502, f"proxy error: {err}")
             except (BrokenPipeError, ConnectionResetError) as disconnected:
                 print(f"[proxy {rid}] CLIENT GONE before the error was written: {disconnected}", flush=True)
             return
 
-        if status < 400 and CODE_MODE_OUTPUT_TOKENS and '/responses' in self.path:
+        if status < 400 and CODE_MODE_OUTPUT_TOKENS and '/responses' in self.path and not raw:
             headers = dict((key.lower(), value) for key, value in resp_headers)
             encoded = headers.get('content-encoding', '').lower() == 'gzip'
             try:
@@ -409,6 +482,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except (OSError, EOFError):
                 # Preserve an invalid upstream encoding for the native error path.
                 pass
+        if metered:
+            headers = dict((key.lower(), value) for key, value in resp_headers)
+            usage = parse_usage(self.path, headers.get('content-type', ''), resp_body,
+                                headers.get('content-encoding', '')) if status < 400 else None
+            LEDGER.record(agent, self.path, status, request_model, usage)
+            if usage:
+                print(f"[proxy {rid}] USAGE agent={agent} " + json.dumps(usage, separators=(',', ':')), flush=True)
         print(f"[proxy {rid}] {self.command} {self.path} in={len(body)}b({length}CL,{'chunked' if 'chunked' in te else 'plain'}) UA={ua!r} -> {status} out={len(resp_body)}b", flush=True)
         if status >= 400:
             try:
